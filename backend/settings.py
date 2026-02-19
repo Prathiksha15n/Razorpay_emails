@@ -25,7 +25,7 @@ SECRET_KEY = 'razorpay_webhook_secret_987654'
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = ["dc16-2406-7400-10c-3f3c-a983-3221-17c8-2d69.ngrok-free.app"]
+ALLOWED_HOSTS = ['*']
 
 CSRF_TRUSTED_ORIGINS = [
     "https://dc16-2406-7400-10c-3f3c-a983-3221-17c8-2d69.ngrok-free.app"
@@ -54,6 +54,7 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
