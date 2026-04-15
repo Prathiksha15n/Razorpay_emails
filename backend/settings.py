@@ -42,6 +42,7 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
 ALLOWED_PAYMENT_PAGE_ID = os.environ.get("ALLOWED_PAYMENT_PAGE_ID", "pl_SE4VewM9goZTNC")
 RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "")
 RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "")
+GOOGLE_SHEETS_WEBAPP_URL = os.environ.get("GOOGLE_SHEETS_WEBAPP_URL", "")
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True

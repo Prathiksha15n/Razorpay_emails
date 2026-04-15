@@ -1,5 +1,7 @@
 import json
 from datetime import date, timedelta
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 from django.conf import settings
 from django.core.mail import EmailMultiAlternatives
 from django.http import JsonResponse
@@ -23,6 +25,64 @@ def _next_saturday_slot() -> str:
         days_until_saturday = 7
     next_saturday = today + timedelta(days=days_until_saturday)
     return f"Saturday, {_ordinal(next_saturday.day)} {next_saturday.strftime('%B')} at 10:00 AM"
+
+
+def _extract_candidate_name(payment: dict, payment_link: dict, notes: dict) -> str:
+    customer = payment_link.get("customer", {}) if isinstance(payment_link.get("customer"), dict) else {}
+    return (
+        payment.get("name")
+        or customer.get("name")
+        or notes.get("name")
+        or notes.get("full_name")
+        or ""
+    )
+
+
+def _extract_candidate_email(payment: dict, payment_link: dict, notes: dict) -> str:
+    customer = payment_link.get("customer", {}) if isinstance(payment_link.get("customer"), dict) else {}
+    return payment.get("email") or customer.get("email") or notes.get("email") or ""
+
+
+def _save_payment_to_google_sheet(payment: dict, payment_link: dict, notes: dict, event: str) -> None:
+    webapp_url = getattr(settings, "GOOGLE_SHEETS_WEBAPP_URL", "")
+    if not webapp_url:
+        return
+
+    payment_id = payment.get("id")
+    if not payment_id:
+        return
+
+    check_url = f"{webapp_url}?{urlencode({'check_payment_id': payment_id})}"
+    check_request = Request(check_url, method="GET")
+    with urlopen(check_request, timeout=8) as response:
+        check_payload = json.loads(response.read().decode("utf-8"))
+        if check_payload.get("exists") is True:
+            return
+
+    amount_paise = payment.get("amount", 0)
+    try:
+        amount_rupees = float(amount_paise) / 100
+    except (TypeError, ValueError):
+        amount_rupees = 0
+
+    sheet_payload = {
+        "payment_id": payment_id,
+        "name": _extract_candidate_name(payment, payment_link, notes),
+        "email": _extract_candidate_email(payment, payment_link, notes),
+        "amount": amount_rupees,
+        "status": event,
+    }
+    body = json.dumps(sheet_payload).encode("utf-8")
+    post_request = Request(
+        webapp_url,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urlopen(post_request, timeout=8) as response:
+        post_payload = json.loads(response.read().decode("utf-8"))
+        if not post_payload.get("success"):
+            raise ValueError("Google Sheets script returned non-success response")
 
 
 @csrf_exempt
@@ -53,7 +113,12 @@ def razorpay_webhook(request):
     if payment_page_id != ALLOWED_EMAIL_PAYMENT_PAGE_ID:
         return JsonResponse({"status": "Email skipped for this payment page"}, status=200)
 
-    email = payment.get("email")
+    try:
+        _save_payment_to_google_sheet(payment, payment_link, notes, event)
+    except Exception as e:
+        return JsonResponse({"error": f"Google Sheets sync failed: {str(e)}"}, status=500)
+
+    email = _extract_candidate_email(payment, payment_link, notes)
     if not email:
         return JsonResponse({"status": "No email to send"}, status=200)
 
