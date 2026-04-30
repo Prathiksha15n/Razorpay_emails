@@ -50,7 +50,7 @@ DEBUG = True
 ALLOWED_HOSTS = ['*']
 
 CSRF_TRUSTED_ORIGINS = [
-    "https://7cc6-2406-7400-10c-ddee-18f0-87-8f43-fda0.ngrok-free.app"
+    "https://razorpay-emails-3af4.onrender.com"
 ]
 EMAIL_HOST_USER = os.environ.get("EMAIL_HOST_USER", "")
 EMAIL_HOST_PASSWORD = os.environ.get("EMAIL_HOST_PASSWORD", "")
