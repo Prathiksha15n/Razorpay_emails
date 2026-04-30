@@ -39,7 +39,7 @@ load_dotenv(BASE_DIR / "backend" / ".env")
 
 SECRET_KEY = "a(w#08xht435!v)odgq%f&07r86qxp52@bieoc=l(!(rxn%3z)"
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
-ALLOWED_PAYMENT_PAGE_ID = os.environ.get("ALLOWED_PAYMENT_PAGE_ID", "pl_SE4VewM9goZTNC")
+ALLOWED_PAYMENT_PAGE_ID = os.environ.get("ALLOWED_PAYMENT_PAGE_ID", "pl_SffFEx86r5CAtm")
 RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "")
 RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "")
 GOOGLE_SHEETS_WEBAPP_URL = os.environ.get("GOOGLE_SHEETS_WEBAPP_URL", "")
@@ -50,7 +50,7 @@ DEBUG = True
 ALLOWED_HOSTS = ['*']
 
 CSRF_TRUSTED_ORIGINS = [
-    "https://cddc-2406-7400-10c-3f3c-a983-3221-17c8-2d69.ngrok-free.app"
+    "https://7cc6-2406-7400-10c-ddee-18f0-87-8f43-fda0.ngrok-free.app"
 ]
 EMAIL_HOST_USER = os.environ.get("EMAIL_HOST_USER", "")
 EMAIL_HOST_PASSWORD = os.environ.get("EMAIL_HOST_PASSWORD", "")
