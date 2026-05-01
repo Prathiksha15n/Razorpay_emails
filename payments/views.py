@@ -1,5 +1,7 @@
+import base64
 import json
-from datetime import date, timedelta
+import logging
+from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
@@ -7,6 +9,8 @@ from django.conf import settings
 from django.core.mail import EmailMultiAlternatives
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
+
+logger = logging.getLogger(__name__)
 
 def _ordinal(day: int) -> str:
     if 11 <= day % 100 <= 13:
@@ -23,6 +27,111 @@ def _next_saturday_slot() -> str:
         days_until_saturday = 7
     next_saturday = today + timedelta(days=days_until_saturday)
     return f"Saturday, {_ordinal(next_saturday.day)} {next_saturday.strftime('%B')} at 10:00 AM"
+
+
+def _combined_notes(payment: dict, payment_link: dict) -> dict:
+    notes: dict = {}
+    for source in (payment, payment_link):
+        if not isinstance(source, dict):
+            continue
+        raw = source.get("notes")
+        if isinstance(raw, dict):
+            notes.update(raw)
+        elif isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    notes.update(parsed)
+            except json.JSONDecodeError:
+                pass
+    return notes
+
+
+def _resolve_payment_entities(payload: dict) -> tuple[dict, dict]:
+    raw_payment = ((payload.get("payment") or {}).get("entity")) or {}
+    raw_link = ((payload.get("payment_link") or {}).get("entity")) or {}
+    payment = dict(raw_payment) if isinstance(raw_payment, dict) else {}
+    payment_link = dict(raw_link) if isinstance(raw_link, dict) else {}
+
+    if not payment.get("id"):
+        pl_payments = payment_link.get("payments")
+        if isinstance(pl_payments, list) and pl_payments:
+            tail = pl_payments[-1]
+            if isinstance(tail, dict) and tail.get("id"):
+                payment = {**tail, **payment}
+            elif isinstance(tail, str) and tail.startswith("pay_"):
+                payment = {**payment, "id": tail}
+
+    customer = payment_link.get("customer") if isinstance(payment_link.get("customer"), dict) else {}
+    for field in ("email", "name", "contact"):
+        if not payment.get(field) and customer.get(field):
+            payment[field] = customer[field]
+
+    return payment, payment_link
+
+
+def _razorpay_basic_auth_header() -> str | None:
+    key_id = getattr(settings, "RAZORPAY_KEY_ID", "") or ""
+    key_secret = getattr(settings, "RAZORPAY_KEY_SECRET", "") or ""
+    key_id, key_secret = key_id.strip(), key_secret.strip()
+    if not key_id or not key_secret:
+        return None
+    token = base64.b64encode(f"{key_id}:{key_secret}".encode()).decode()
+    return f"Basic {token}"
+
+
+def _merge_payment_from_api(payment: dict, api_entity: dict) -> dict:
+    if not api_entity:
+        return payment
+    out = dict(payment)
+    for key, value in api_entity.items():
+        if value in (None, "", [], {}):
+            continue
+        if out.get(key) in (None, "", [], {}):
+            out[key] = value
+    return out
+
+
+def _fetch_payment_from_razorpay_api(payment_id: str) -> dict:
+    auth = _razorpay_basic_auth_header()
+    if not auth or not payment_id:
+        return {}
+    url = f"https://api.razorpay.com/v1/payments/{payment_id}"
+    req = Request(url, headers={"Authorization": auth}, method="GET")
+    try:
+        with urlopen(req, timeout=12) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        logger.warning("Razorpay payment fetch failed for %s: %s", payment_id, exc)
+        return {}
+
+
+def _enrich_payment_from_razorpay(payment: dict) -> dict:
+    pid = payment.get("id")
+    if not pid:
+        return payment
+    if not _razorpay_basic_auth_header():
+        return payment
+    needs = (
+        not payment.get("email")
+        or not payment.get("name")
+        or not payment.get("payment_link_id")
+    )
+    if not needs:
+        return payment
+    api_entity = _fetch_payment_from_razorpay_api(pid)
+    return _merge_payment_from_api(payment, api_entity)
+
+
+def _sheet_row_timestamp(payment: dict) -> str:
+    ts = payment.get("created_at")
+    if ts is not None:
+        try:
+            dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+            return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+        except (TypeError, ValueError, OSError):
+            pass
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 def _extract_candidate_name(payment: dict, payment_link: dict, notes: dict) -> str:
@@ -64,13 +173,16 @@ def _decode_json_response(response_body: bytes) -> dict:
 
 
 def _save_payment_to_google_sheet(payment: dict, payment_link: dict, notes: dict, event: str) -> None:
-    webapp_url = getattr(settings, "GOOGLE_SHEETS_WEBAPP_URL", "")
+    webapp_url = (getattr(settings, "GOOGLE_SHEETS_WEBAPP_URL", "") or "").strip()
     if not webapp_url:
-        return
+        raise ValueError(
+            "GOOGLE_SHEETS_WEBAPP_URL is not set. Add it to environment variables "
+            "(Render dashboard or .env) so rows can be appended."
+        )
 
     payment_id = payment.get("id")
     if not payment_id:
-        return
+        raise ValueError("Payment id missing in webhook payload; cannot sync to Google Sheets.")
 
     check_url = f"{webapp_url}?{urlencode({'check_payment_id': payment_id})}"
     check_request = Request(check_url, method="GET")
@@ -90,11 +202,13 @@ def _save_payment_to_google_sheet(payment: dict, payment_link: dict, notes: dict
     except (TypeError, ValueError):
         amount_rupees = 0
 
+    # Column order must match the sheet: Payment ID, Email, Name, Amount, Date, status
     sheet_payload = {
         "payment_id": payment_id,
-        "name": _extract_candidate_name(payment, payment_link, notes),
         "email": _extract_candidate_email(payment, payment_link, notes),
+        "name": _extract_candidate_name(payment, payment_link, notes),
         "amount": amount_rupees,
+        "date": _sheet_row_timestamp(payment),
         "status": event,
     }
     body = json.dumps(sheet_payload).encode("utf-8")
@@ -115,9 +229,9 @@ def razorpay_webhook(request):
     if request.method != "POST":
         return JsonResponse({"error": "Invalid request method"}, status=400)
 
-    payload = request.body
+    raw_body = request.body
     try:
-        data = json.loads(payload.decode("utf-8"))
+        data = json.loads(raw_body.decode("utf-8"))
     except Exception:
         return JsonResponse({"error": "Invalid JSON"}, status=400)
 
@@ -125,11 +239,18 @@ def razorpay_webhook(request):
     if event not in ["payment.captured", "payment_link.paid"]:
         return JsonResponse({"status": "Ignored event"}, status=200)
 
-    payment = data.get("payload", {}).get("payment", {}).get("entity", {})
-    payment_link = data.get("payload", {}).get("payment_link", {}).get("entity", {})
-    notes = payment.get("notes", {}) if isinstance(payment.get("notes"), dict) else {}
+    event_payload = data.get("payload") or {}
+    payment, payment_link = _resolve_payment_entities(event_payload)
+    payment = _enrich_payment_from_razorpay(payment)
+    notes = _combined_notes(payment, payment_link)
 
     if not _matches_allowed_payment_page_id(payment, payment_link, notes):
+        logger.info(
+            "Webhook skipped: payment page id did not match. event=%s payment_link_id=%s link_entity_id=%s",
+            event,
+            payment.get("payment_link_id"),
+            payment_link.get("id"),
+        )
         return JsonResponse({"status": "Email skipped for this payment page"}, status=200)
 
     try:
@@ -145,8 +266,9 @@ def razorpay_webhook(request):
         return JsonResponse(
             {
                 "error": (
-                    "SMTP is not configured. Set EMAIL_HOST_USER and "
-                    "EMAIL_HOST_PASSWORD, then restart the server."
+                    "SMTP is not configured. Set EMAIL_HOST_USER and EMAIL_HOST_PASSWORD "
+                    "in your hosting environment (for example Render environment variables), "
+                    "redeploy or restart, and ensure Gmail uses an app password if required."
                 )
             },
             status=503,
