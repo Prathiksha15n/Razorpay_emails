@@ -3,12 +3,13 @@ import json
 import logging
 from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
-from urllib.error import HTTPError, URLError
+
+import requests
 from django.conf import settings
 from django.core.mail import EmailMultiAlternatives
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_GET
 
 logger = logging.getLogger(__name__)
 
@@ -97,27 +98,54 @@ def _fetch_payment_from_razorpay_api(payment_id: str) -> dict:
     if not auth or not payment_id:
         return {}
     url = f"https://api.razorpay.com/v1/payments/{payment_id}"
-    req = Request(url, headers={"Authorization": auth}, method="GET")
     try:
-        with urlopen(req, timeout=12) as response:
-            return json.loads(response.read().decode("utf-8"))
+        r = requests.get(url, headers={"Authorization": auth}, timeout=15)
+        r.raise_for_status()
+        return r.json()
     except Exception as exc:
         logger.warning("Razorpay payment fetch failed for %s: %s", payment_id, exc)
         return {}
 
 
+def _fetch_payment_link_by_id(link_id: str) -> dict:
+    auth = _razorpay_basic_auth_header()
+    if not auth or not link_id:
+        return {}
+    url = f"https://api.razorpay.com/v1/payment_links/{link_id}"
+    try:
+        r = requests.get(url, headers={"Authorization": auth}, timeout=15)
+        r.raise_for_status()
+        return r.json()
+    except Exception as exc:
+        logger.warning("Razorpay payment link fetch failed for %s: %s", link_id, exc)
+        return {}
+
+
+def _payment_stub_from_link_entity(link_entity: dict) -> dict:
+    if not link_entity:
+        return {}
+    payments = link_entity.get("payments")
+    if not isinstance(payments, list) or not payments:
+        return {}
+    tail = payments[-1]
+    if isinstance(tail, str):
+        return {"id": tail, "amount": link_entity.get("amount")}
+    if isinstance(tail, dict):
+        pid = tail.get("payment_id") or tail.get("id")
+        out: dict = {}
+        if pid:
+            out["id"] = pid
+        if tail.get("amount") is not None:
+            out["amount"] = tail["amount"]
+        elif link_entity.get("amount") is not None:
+            out["amount"] = link_entity.get("amount")
+        return out
+    return {}
+
+
 def _enrich_payment_from_razorpay(payment: dict) -> dict:
     pid = payment.get("id")
-    if not pid:
-        return payment
-    if not _razorpay_basic_auth_header():
-        return payment
-    needs = (
-        not payment.get("email")
-        or not payment.get("name")
-        or not payment.get("payment_link_id")
-    )
-    if not needs:
+    if not pid or not _razorpay_basic_auth_header():
         return payment
     api_entity = _fetch_payment_from_razorpay_api(pid)
     return _merge_payment_from_api(payment, api_entity)
@@ -166,14 +194,28 @@ def _matches_allowed_payment_page_id(payment: dict, payment_link: dict, notes: d
     return allowed_page_id in normalized
 
 
-def _decode_json_response(response_body: bytes) -> dict:
-    if not response_body:
-        return {}
-    return json.loads(response_body.decode("utf-8"))
+def _page_id_candidates(payment: dict, payment_link: dict, notes: dict) -> list[str]:
+    raw = [
+        payment.get("payment_link_id"),
+        payment_link.get("id"),
+        payment_link.get("reference_id"),
+        notes.get("payment_page_id"),
+        notes.get("payment_link_id"),
+    ]
+    return [str(x).strip() for x in raw if isinstance(x, str) and str(x).strip()]
+
+
+WEBHOOK_HANDLED_EVENTS = frozenset(
+    {
+        "payment.captured",
+        "payment_link.paid",
+        "order.paid",
+    }
+)
 
 
 def _save_payment_to_google_sheet(payment: dict, payment_link: dict, notes: dict, event: str) -> None:
-    webapp_url = (getattr(settings, "GOOGLE_SHEETS_WEBAPP_URL", "") or "").strip()
+    webapp_url = (getattr(settings, "GOOGLE_SHEETS_WEBAPP_URL", "") or "").strip().rstrip("/")
     if not webapp_url:
         raise ValueError(
             "GOOGLE_SHEETS_WEBAPP_URL is not set. Add it to environment variables "
@@ -185,15 +227,16 @@ def _save_payment_to_google_sheet(payment: dict, payment_link: dict, notes: dict
         raise ValueError("Payment id missing in webhook payload; cannot sync to Google Sheets.")
 
     check_url = f"{webapp_url}?{urlencode({'check_payment_id': payment_id})}"
-    check_request = Request(check_url, method="GET")
     try:
-        with urlopen(check_request, timeout=8) as response:
-            check_payload = _decode_json_response(response.read())
-            if check_payload.get("exists") is True:
-                return
-    except (HTTPError, URLError, TimeoutError, ValueError):
-        # Some Apps Script deployments skip duplicate-check support;
-        # continue with POST to avoid dropping legit webhook rows.
+        r = requests.get(check_url, timeout=15)
+        if r.ok:
+            try:
+                check_payload = r.json()
+                if check_payload.get("exists") is True:
+                    return
+            except ValueError:
+                pass
+    except requests.RequestException:
         pass
 
     amount_paise = payment.get("amount", 0)
@@ -211,17 +254,55 @@ def _save_payment_to_google_sheet(payment: dict, payment_link: dict, notes: dict
         "date": _sheet_row_timestamp(payment),
         "status": event,
     }
-    body = json.dumps(sheet_payload).encode("utf-8")
-    post_request = Request(
-        webapp_url,
-        data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
+    try:
+        r = requests.post(
+            webapp_url,
+            json=sheet_payload,
+            headers={"Content-Type": "application/json"},
+            timeout=25,
+        )
+    except requests.RequestException as exc:
+        raise ValueError(f"Google Sheets web app request failed: {exc}") from exc
+
+    if not r.ok:
+        snippet = (r.text or "")[:400]
+        raise ValueError(f"Google Sheets web app HTTP {r.status_code}: {snippet}")
+
+    try:
+        post_payload = r.json()
+    except ValueError:
+        raise ValueError(
+            f"Google Sheets web app returned non-JSON (check deployment URL and Apps Script). Body: {(r.text or '')[:400]}"
+        )
+
+    if post_payload.get("success") is not True:
+        raise ValueError(f"Google Sheets script did not report success: {post_payload}")
+
+
+@require_GET
+def integration_health(request):
+    sheet = (getattr(settings, "GOOGLE_SHEETS_WEBAPP_URL", "") or "").strip()
+    allowed = (getattr(settings, "ALLOWED_PAYMENT_PAGE_ID", "") or "").strip()
+    return JsonResponse(
+        {
+            "google_sheets_webapp_configured": bool(sheet),
+            "google_sheets_url_host_hint": sheet.split("/")[2] if sheet.startswith("http") and len(sheet.split("/")) > 2 else "",
+            "smtp_configured": settings.EMAIL_BACKEND
+            == "django.core.mail.backends.smtp.EmailBackend",
+            "email_host": getattr(settings, "EMAIL_HOST", ""),
+            "email_port": getattr(settings, "EMAIL_PORT", None),
+            "email_use_tls": getattr(settings, "EMAIL_USE_TLS", None),
+            "email_use_ssl": getattr(settings, "EMAIL_USE_SSL", None),
+            "allowed_payment_page_id_configured": bool(allowed),
+            "razorpay_api_configured": bool(
+                (getattr(settings, "RAZORPAY_KEY_ID", "") or "").strip()
+                and (getattr(settings, "RAZORPAY_KEY_SECRET", "") or "").strip()
+            ),
+            "webhook_post_path": "/api/razorpay/webhook/",
+            "note": "If smtp_configured is false on Render, set EMAIL_HOST_USER and EMAIL_HOST_PASSWORD. "
+            "Apps Script web app must be deployed with access: Anyone.",
+        }
     )
-    with urlopen(post_request, timeout=8) as response:
-        post_payload = _decode_json_response(response.read())
-        if post_payload and post_payload.get("success") is False:
-            raise ValueError("Google Sheets script returned non-success response")
 
 
 @csrf_exempt
@@ -236,22 +317,44 @@ def razorpay_webhook(request):
         return JsonResponse({"error": "Invalid JSON"}, status=400)
 
     event = data.get("event")
-    if event not in ["payment.captured", "payment_link.paid"]:
-        return JsonResponse({"status": "Ignored event"}, status=200)
+    if event not in WEBHOOK_HANDLED_EVENTS:
+        return JsonResponse({"status": "Ignored event", "event": event}, status=200)
 
     event_payload = data.get("payload") or {}
     payment, payment_link = _resolve_payment_entities(event_payload)
+
+    if not payment.get("id") and payment_link.get("id"):
+        link_json = _fetch_payment_link_by_id(payment_link["id"])
+        stub = _payment_stub_from_link_entity(link_json)
+        payment = {**stub, **payment}
+
     payment = _enrich_payment_from_razorpay(payment)
     notes = _combined_notes(payment, payment_link)
 
-    if not _matches_allowed_payment_page_id(payment, payment_link, notes):
+    allowed_pid = (getattr(settings, "ALLOWED_PAYMENT_PAGE_ID", "") or "").strip()
+    if allowed_pid and not _matches_allowed_payment_page_id(payment, payment_link, notes):
+        candidates = _page_id_candidates(payment, payment_link, notes)
         logger.info(
-            "Webhook skipped: payment page id did not match. event=%s payment_link_id=%s link_entity_id=%s",
+            "Webhook skipped: payment page id did not match. event=%s allowed=%s candidates=%s",
             event,
-            payment.get("payment_link_id"),
-            payment_link.get("id"),
+            allowed_pid,
+            candidates,
         )
-        return JsonResponse({"status": "Email skipped for this payment page"}, status=200)
+        return JsonResponse(
+            {
+                "status": "Email skipped for this payment page",
+                "allowed_payment_page_id": allowed_pid,
+                "seen_payment_link_ids": candidates,
+                "fix": "Set ALLOWED_PAYMENT_PAGE_ID on Render to one of seen_payment_link_ids, or use the same Payment Link id in Razorpay.",
+            },
+            status=200,
+        )
+
+    logger.info(
+        "Razorpay webhook accepted: event=%s payment_id=%s",
+        event,
+        payment.get("id"),
+    )
 
     try:
         _save_payment_to_google_sheet(payment, payment_link, notes, event)
