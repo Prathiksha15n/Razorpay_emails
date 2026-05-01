@@ -39,7 +39,12 @@ load_dotenv(BASE_DIR / "backend" / ".env")
 
 SECRET_KEY = "a(w#08xht435!v)odgq%f&07r86qxp52@bieoc=l(!(rxn%3z)"
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
-NOTES_EMAIL_GATE_VALUE = os.environ.get("NOTES_EMAIL_GATE_VALUE", "Testing_of_CE")
+# Only this amount in whole rupees (Razorpay sends paise for INR) triggers Sheet row + confirmation email.
+_raw_rr = os.environ.get("REQUIRED_PAYMENT_RUPEES_FOR_EMAIL", "99")
+try:
+    REQUIRED_PAYMENT_RUPEES_FOR_EMAIL = int(_raw_rr)
+except ValueError:
+    REQUIRED_PAYMENT_RUPEES_FOR_EMAIL = 99
 RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "")
 RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "")
 GOOGLE_SHEETS_WEBAPP_URL = os.environ.get("GOOGLE_SHEETS_WEBAPP_URL", "")

@@ -178,21 +178,24 @@ def _extract_candidate_email(payment: dict, payment_link: dict, notes: dict) -> 
     return payment.get("email") or customer.get("email") or notes.get("email") or ""
 
 
-def _notes_pass_send_gate(notes: dict) -> bool:
-    """Require Razorpay notes to include NOTES_EMAIL_GATE_VALUE before sheet + email run."""
-    required = (getattr(settings, "NOTES_EMAIL_GATE_VALUE", "") or "").strip()
-    if not required:
+def _payment_amount_paise(payment: dict) -> int:
+    raw = payment.get("amount")
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _paid_amount_matches_email_threshold(payment: dict) -> bool:
+    """Sheet + email only when captured payment amount is exactly REQUIRED_PAYMENT_RUPEES_FOR_EMAIL (INR paise)."""
+    required_rupees = int(getattr(settings, "REQUIRED_PAYMENT_RUPEES_FOR_EMAIL", 99))
+    if required_rupees < 0:
         return True
-    if required in notes:
-        val = notes[required]
-        if val not in (None, "", False):
-            return True
-    for v in notes.values():
-        if v == required:
-            return True
-        if isinstance(v, str) and v.strip() == required:
-            return True
-    return False
+    currency = (payment.get("currency") or "INR").upper()
+    if currency != "INR":
+        return False
+    required_paise = required_rupees * 100
+    return _payment_amount_paise(payment) == required_paise
 
 
 WEBHOOK_HANDLED_EVENTS = frozenset(
@@ -272,7 +275,7 @@ def _save_payment_to_google_sheet(payment: dict, payment_link: dict, notes: dict
 @require_GET
 def integration_health(request):
     sheet = (getattr(settings, "GOOGLE_SHEETS_WEBAPP_URL", "") or "").strip()
-    gate = (getattr(settings, "NOTES_EMAIL_GATE_VALUE", "") or "").strip()
+    required_inr = int(getattr(settings, "REQUIRED_PAYMENT_RUPEES_FOR_EMAIL", 99))
     return JsonResponse(
         {
             "google_sheets_webapp_configured": bool(sheet),
@@ -283,17 +286,16 @@ def integration_health(request):
             "email_port": getattr(settings, "EMAIL_PORT", None),
             "email_use_tls": getattr(settings, "EMAIL_USE_TLS", None),
             "email_use_ssl": getattr(settings, "EMAIL_USE_SSL", None),
-            "notes_email_gate_required_value": gate or None,
-            "notes_email_gate_active": bool(gate),
+            "required_payment_rupees_inr_for_sheet_and_email": required_inr,
+            "required_amount_paise_inr": required_inr * 100,
             "razorpay_api_configured": bool(
                 (getattr(settings, "RAZORPAY_KEY_ID", "") or "").strip()
                 and (getattr(settings, "RAZORPAY_KEY_SECRET", "") or "").strip()
             ),
             "webhook_post_path": "/api/razorpay/webhook/",
-            "note": "Sheet row + email run only when merged payment/payment_link notes include NOTES_EMAIL_GATE_VALUE "
-            "(default Testing_of_CE). Set on the Razorpay Payment Link (notes). "
-            "If smtp_configured is false on Render, set EMAIL_HOST_USER and EMAIL_HOST_PASSWORD. "
-            "Apps Script web app must be deployed with access: Anyone.",
+            "note": "Sheet row + email run only when payment amount is exactly REQUIRED_PAYMENT_RUPEES_FOR_EMAIL INR "
+            "(default 99, i.e. 9900 paise). Other amounts return HTTP 200 but are skipped. "
+            "Configure EMAIL_* on Render and GOOGLE_SHEETS_WEBAPP_URL as before.",
         }
     )
 
@@ -324,21 +326,26 @@ def razorpay_webhook(request):
     payment = _enrich_payment_from_razorpay(payment)
     notes = _combined_notes(payment, payment_link)
 
-    gate_value = (getattr(settings, "NOTES_EMAIL_GATE_VALUE", "") or "").strip()
-    if gate_value and not _notes_pass_send_gate(notes):
+    if not _paid_amount_matches_email_threshold(payment):
+        paid_paise = _payment_amount_paise(payment)
+        required_inr = int(getattr(settings, "REQUIRED_PAYMENT_RUPEES_FOR_EMAIL", 99))
         logger.info(
-            "Webhook skipped: notes gate not satisfied. event=%s payment_id=%s note_keys=%s",
+            "Webhook skipped: amount not eligible for sheet/email. event=%s payment_id=%s paise=%s required_paise=%s currency=%s",
             event,
             payment.get("id"),
-            list(notes.keys()),
+            paid_paise,
+            max(0, required_inr) * 100,
+            payment.get("currency"),
         )
         return JsonResponse(
             {
-                "status": "Skipped: notes do not include required value for sheet and email",
-                "required_notes_marker": gate_value,
-                "hint": "Add this value as a Razorpay Payment Link note (e.g. key purpose, value Testing_of_CE), "
-                "or a note key exactly matching the marker with a non-empty value.",
-                "seen_note_keys": list(notes.keys()),
+                "status": "Skipped: amount does not match required INR for sheet and email",
+                "required_rupees": max(0, required_inr),
+                "required_paise_inr": max(0, required_inr) * 100,
+                "paid_paise": paid_paise,
+                "paid_rupees_approx": round(paid_paise / 100, 2) if paid_paise else 0,
+                "currency_seen": payment.get("currency") or "INR",
+                "gate_disabled_note": "Set REQUIRED_PAYMENT_RUPEES_FOR_EMAIL=-1 to allow any INR amount (not recommended).",
             },
             status=200,
         )
