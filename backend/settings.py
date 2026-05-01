@@ -48,6 +48,10 @@ except ValueError:
 RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "")
 RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "")
 GOOGLE_SHEETS_WEBAPP_URL = os.environ.get("GOOGLE_SHEETS_WEBAPP_URL", "")
+# When true, webhook JSON includes a "diagnostics" object (safe fields) so Razorpay delivery logs show the failure step.
+WEBHOOK_VERBOSE_DIAGNOSTICS = os.environ.get(
+    "WEBHOOK_VERBOSE_DIAGNOSTICS", "true"
+).lower() in ("1", "true", "yes")
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
@@ -165,3 +169,35 @@ USE_TZ = True
 
 STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
 STATIC_URL = '/static/'
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "payments": {
+            "format": "%(levelname)s %(asctime)s [%(name)s] %(message)s",
+        },
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "payments",
+        },
+    },
+    "root": {
+        "handlers": ["console"],
+        "level": "INFO",
+    },
+    "loggers": {
+        "django": {
+            "handlers": ["console"],
+            "level": "INFO",
+            "propagate": False,
+        },
+        "payments": {
+            "handlers": ["console"],
+            "level": "INFO",
+            "propagate": False,
+        },
+    },
+}

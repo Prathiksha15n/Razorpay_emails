@@ -1,6 +1,7 @@
 import base64
 import json
 import logging
+import secrets
 from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlencode
 
@@ -12,6 +13,21 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET
 
 logger = logging.getLogger(__name__)
+
+
+def _mask_email(email: str) -> str:
+    if not email or "@" not in email:
+        return ""
+    local, _, domain = email.partition("@")
+    if len(local) <= 2:
+        return f"***@{domain}"
+    return f"{local[:2]}***@{domain}"
+
+
+def _webhook_response(data: dict, status: int, diagnostics: dict | None = None) -> JsonResponse:
+    if diagnostics is not None and getattr(settings, "WEBHOOK_VERBOSE_DIAGNOSTICS", True):
+        return JsonResponse({**data, "diagnostics": diagnostics}, status=status)
+    return JsonResponse(data, status=status)
 
 def _ordinal(day: int) -> str:
     if 11 <= day % 100 <= 13:
@@ -198,6 +214,46 @@ def _paid_amount_matches_email_threshold(payment: dict) -> bool:
     return _payment_amount_paise(payment) == required_paise
 
 
+def _build_webhook_diagnostics(
+    trace_id: str,
+    *,
+    step: str,
+    event: str | None = None,
+    payment: dict | None = None,
+    payment_link: dict | None = None,
+    recipient_email: str | None = None,
+    **extra: object,
+) -> dict:
+    p = payment if isinstance(payment, dict) else {}
+    pl = payment_link if isinstance(payment_link, dict) else {}
+    required_inr = int(getattr(settings, "REQUIRED_PAYMENT_RUPEES_FOR_EMAIL", 99))
+    paise = _payment_amount_paise(p)
+    out: dict = {
+        "trace_id": trace_id,
+        "pipeline_step": step,
+        "event": event,
+        "payment_id": p.get("id"),
+        "payment_link_entity_id": pl.get("id"),
+        "amount_paise": paise,
+        "currency_reported": p.get("currency") or "INR",
+        "amount_rupees_approx": round(paise / 100, 2) if paise else 0.0,
+        "amount_required_paise_inr": max(0, required_inr) * 100,
+        "amount_gate_passed": _paid_amount_matches_email_threshold(p) if p else False,
+        "google_sheets_url_configured": bool(
+            (getattr(settings, "GOOGLE_SHEETS_WEBAPP_URL", "") or "").strip()
+        ),
+        "smtp_is_active_backend": settings.EMAIL_BACKEND
+        == "django.core.mail.backends.smtp.EmailBackend",
+        "razorpay_live_api_auth_configured": bool(_razorpay_basic_auth_header()),
+    }
+    if recipient_email:
+        out["recipient_email_masked"] = _mask_email(recipient_email)
+    for k, v in extra.items():
+        if v is not None:
+            out[k] = v
+    return out
+
+
 WEBHOOK_HANDLED_EVENTS = frozenset(
     {
         "payment.captured",
@@ -293,6 +349,18 @@ def integration_health(request):
                 and (getattr(settings, "RAZORPAY_KEY_SECRET", "") or "").strip()
             ),
             "webhook_post_path": "/api/razorpay/webhook/",
+            "webhook_debug_guide_path": "/api/payments/webhook-debug/",
+            "verbose_webhook_diagnostics_enabled": getattr(
+                settings, "WEBHOOK_VERBOSE_DIAGNOSTICS", True
+            ),
+            "how_to_debug": [
+                "Open Razorpay Dashboard → Account & Settings → Webhooks → your URL → Webhook Logs → click a delivery. The Response body now includes diagnostics.trace_id and pipeline_step.",
+                "Open Render Dashboard → your service → Logs. Search for that trace_id (8 hex chars) or payment_id.",
+                "Call GET /api/payments/health/ to verify google_sheets_webapp_configured and smtp_configured.",
+                "If pipeline_step is ignored_event_not_in_handled_list, add the event in Razorpay or use a link that emits payment.captured / payment_link.paid / order.paid.",
+                "If stopped_amount_gate_failed, payment amount_paise must equal required_amount_paise_inr (9900 for 99 INR).",
+                "Set WEBHOOK_VERBOSE_DIAGNOSTICS=false on Render to hide diagnostics in webhook responses.",
+            ],
             "note": "Sheet row + email run only when payment amount is exactly REQUIRED_PAYMENT_RUPEES_FOR_EMAIL INR "
             "(default 99, i.e. 9900 paise). Other amounts return HTTP 200 but are skipped. "
             "Configure EMAIL_* on Render and GOOGLE_SHEETS_WEBAPP_URL as before.",
@@ -300,20 +368,69 @@ def integration_health(request):
     )
 
 
+@require_GET
+def webhook_debug_guide(request):
+    return JsonResponse(
+        {
+            "where_to_look": {
+                "razorpay": "Dashboard → Account & Settings → Webhooks → select endpoint → Logs / Recent deliveries → open one row → Response body.",
+                "render": "dashboard.render.com → Your Web Service → Logs (stdout). Every webhook line is prefixed with trace_id in log messages.",
+            },
+            "response_fields": {
+                "diagnostics.trace_id": "Match this in Render logs.",
+                "diagnostics.pipeline_step": "Last stage reached; use the how_to_debug list in GET /api/payments/health/ for meanings.",
+                "diagnostics.amount_gate_passed": "Must be true for sheet+email (99 INR = 9900 paise).",
+                "diagnostics.smtp_is_active_backend": "Must be true on production or email is never sent (503).",
+            },
+            "env_vars_to_verify_on_render": [
+                "GOOGLE_SHEETS_WEBAPP_URL",
+                "EMAIL_HOST_USER",
+                "EMAIL_HOST_PASSWORD",
+                "RAZORPAY_KEY_ID",
+                "RAZORPAY_KEY_SECRET",
+                "REQUIRED_PAYMENT_RUPEES_FOR_EMAIL",
+                "WEBHOOK_VERBOSE_DIAGNOSTICS",
+            ],
+        }
+    )
+
+
 @csrf_exempt
 def razorpay_webhook(request):
+    trace_id = secrets.token_hex(4)
+
     if request.method != "POST":
-        return JsonResponse({"error": "Invalid request method"}, status=400)
+        logger.warning("[%s] razorpay_webhook rejected: not POST", trace_id)
+        return _webhook_response(
+            {"error": "Invalid request method"},
+            400,
+            _build_webhook_diagnostics(trace_id, step="reject_not_post"),
+        )
 
     raw_body = request.body
     try:
         data = json.loads(raw_body.decode("utf-8"))
     except Exception:
-        return JsonResponse({"error": "Invalid JSON"}, status=400)
+        logger.warning("[%s] razorpay_webhook rejected: invalid JSON", trace_id)
+        return _webhook_response(
+            {"error": "Invalid JSON"},
+            400,
+            _build_webhook_diagnostics(trace_id, step="reject_invalid_json"),
+        )
 
     event = data.get("event")
     if event not in WEBHOOK_HANDLED_EVENTS:
-        return JsonResponse({"status": "Ignored event", "event": event}, status=200)
+        logger.info("[%s] razorpay_webhook ignored event=%s", trace_id, event)
+        return _webhook_response(
+            {"status": "Ignored event", "event": event},
+            200,
+            _build_webhook_diagnostics(
+                trace_id,
+                step="ignored_event_not_in_handled_list",
+                event=event,
+                handled_events=sorted(WEBHOOK_HANDLED_EVENTS),
+            ),
+        )
 
     event_payload = data.get("payload") or {}
     payment, payment_link = _resolve_payment_entities(event_payload)
@@ -330,14 +447,15 @@ def razorpay_webhook(request):
         paid_paise = _payment_amount_paise(payment)
         required_inr = int(getattr(settings, "REQUIRED_PAYMENT_RUPEES_FOR_EMAIL", 99))
         logger.info(
-            "Webhook skipped: amount not eligible for sheet/email. event=%s payment_id=%s paise=%s required_paise=%s currency=%s",
+            "[%s] amount_gate_fail event=%s payment_id=%s paise=%s required_paise=%s currency=%s",
+            trace_id,
             event,
             payment.get("id"),
             paid_paise,
             max(0, required_inr) * 100,
             payment.get("currency"),
         )
-        return JsonResponse(
+        return _webhook_response(
             {
                 "status": "Skipped: amount does not match required INR for sheet and email",
                 "required_rupees": max(0, required_inr),
@@ -347,26 +465,64 @@ def razorpay_webhook(request):
                 "currency_seen": payment.get("currency") or "INR",
                 "gate_disabled_note": "Set REQUIRED_PAYMENT_RUPEES_FOR_EMAIL=-1 to allow any INR amount (not recommended).",
             },
-            status=200,
+            200,
+            _build_webhook_diagnostics(
+                trace_id,
+                step="stopped_amount_gate_failed",
+                event=event,
+                payment=payment,
+                payment_link=payment_link,
+            ),
         )
 
     logger.info(
-        "Razorpay webhook accepted: event=%s payment_id=%s",
+        "[%s] amount_gate_ok event=%s payment_id=%s paise=%s",
+        trace_id,
         event,
         payment.get("id"),
+        _payment_amount_paise(payment),
     )
 
     try:
         _save_payment_to_google_sheet(payment, payment_link, notes, event)
     except Exception as e:
-        return JsonResponse({"error": f"Google Sheets sync failed: {str(e)}"}, status=500)
+        logger.exception("[%s] google_sheets_error payment_id=%s", trace_id, payment.get("id"))
+        return _webhook_response(
+            {"error": f"Google Sheets sync failed: {str(e)}"},
+            500,
+            _build_webhook_diagnostics(
+                trace_id,
+                step="failed_google_sheets_after_amount_ok",
+                event=event,
+                payment=payment,
+                payment_link=payment_link,
+                sheets_error_short=str(e)[:220],
+            ),
+        )
 
     email = _extract_candidate_email(payment, payment_link, notes)
     if not email:
-        return JsonResponse({"status": "No email to send"}, status=200)
+        logger.info("[%s] no_recipient_email payment_id=%s", trace_id, payment.get("id"))
+        return _webhook_response(
+            {"status": "No email to send"},
+            200,
+            _build_webhook_diagnostics(
+                trace_id,
+                step="stopped_no_email_on_payment_or_customer",
+                event=event,
+                payment=payment,
+                payment_link=payment_link,
+                note_keys=list(notes.keys()),
+            ),
+        )
 
     if settings.EMAIL_BACKEND != "django.core.mail.backends.smtp.EmailBackend":
-        return JsonResponse(
+        logger.error(
+            "[%s] smtp_not_configured backend=%s",
+            trace_id,
+            settings.EMAIL_BACKEND,
+        )
+        return _webhook_response(
             {
                 "error": (
                     "SMTP is not configured. Set EMAIL_HOST_USER and EMAIL_HOST_PASSWORD "
@@ -374,7 +530,16 @@ def razorpay_webhook(request):
                     "redeploy or restart, and ensure Gmail uses an app password if required."
                 )
             },
-            status=503,
+            503,
+            _build_webhook_diagnostics(
+                trace_id,
+                step="failed_smtp_not_configured_sheet_already_saved",
+                event=event,
+                payment=payment,
+                payment_link=payment_link,
+                recipient_email=email,
+                email_backend=settings.EMAIL_BACKEND,
+            ),
         )
 
     subject = "Campus Experience Appointment Confirmation : Incanto Dynamics Private Ltd."
@@ -603,8 +768,45 @@ Warm regards,<br>
         email_message.attach_alternative(html_content, "text/html")
         sent_count = email_message.send()
         if sent_count < 1:
-            return JsonResponse({"error": "SMTP accepted zero recipients"}, status=500)
+            logger.error("[%s] smtp_zero_recipients payment_id=%s", trace_id, payment.get("id"))
+            return _webhook_response(
+                {"error": "SMTP accepted zero recipients"},
+                500,
+                _build_webhook_diagnostics(
+                    trace_id,
+                    step="failed_smtp_zero_recipients",
+                    event=event,
+                    payment=payment,
+                    payment_link=payment_link,
+                    recipient_email=email,
+                ),
+            )
     except Exception as e:
-        return JsonResponse({"error": f"Email sending failed: {str(e)}"}, status=500)
+        logger.exception("[%s] email_send_exception payment_id=%s", trace_id, payment.get("id"))
+        return _webhook_response(
+            {"error": f"Email sending failed: {str(e)}"},
+            500,
+            _build_webhook_diagnostics(
+                trace_id,
+                step="failed_smtp_exception_after_sheet_ok",
+                event=event,
+                payment=payment,
+                payment_link=payment_link,
+                recipient_email=email,
+                email_error_short=str(e)[:220],
+            ),
+        )
 
-    return JsonResponse({"status": "Webhook processed and email sent"}, status=200)
+    logger.info("[%s] success sheet+email payment_id=%s", trace_id, payment.get("id"))
+    return _webhook_response(
+        {"status": "Webhook processed and email sent"},
+        200,
+        _build_webhook_diagnostics(
+            trace_id,
+            step="complete_sheet_saved_email_sent",
+            event=event,
+            payment=payment,
+            payment_link=payment_link,
+            recipient_email=email,
+        ),
+    )
