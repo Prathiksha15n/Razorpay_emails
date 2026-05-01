@@ -39,7 +39,7 @@ load_dotenv(BASE_DIR / "backend" / ".env")
 
 SECRET_KEY = "a(w#08xht435!v)odgq%f&07r86qxp52@bieoc=l(!(rxn%3z)"
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
-ALLOWED_PAYMENT_PAGE_ID = os.environ.get("ALLOWED_PAYMENT_PAGE_ID", "pl_SdfIYqzSAAzoB2")
+NOTES_EMAIL_GATE_VALUE = os.environ.get("NOTES_EMAIL_GATE_VALUE", "Testing_of_CE")
 RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "")
 RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "")
 GOOGLE_SHEETS_WEBAPP_URL = os.environ.get("GOOGLE_SHEETS_WEBAPP_URL", "")

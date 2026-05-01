@@ -178,31 +178,21 @@ def _extract_candidate_email(payment: dict, payment_link: dict, notes: dict) -> 
     return payment.get("email") or customer.get("email") or notes.get("email") or ""
 
 
-def _matches_allowed_payment_page_id(payment: dict, payment_link: dict, notes: dict) -> bool:
-    allowed_page_id = getattr(settings, "ALLOWED_PAYMENT_PAGE_ID", "").strip()
-    if not allowed_page_id:
+def _notes_pass_send_gate(notes: dict) -> bool:
+    """Require Razorpay notes to include NOTES_EMAIL_GATE_VALUE before sheet + email run."""
+    required = (getattr(settings, "NOTES_EMAIL_GATE_VALUE", "") or "").strip()
+    if not required:
         return True
-
-    candidates = {
-        payment.get("payment_link_id"),
-        payment_link.get("id"),
-        payment_link.get("reference_id"),
-        notes.get("payment_page_id"),
-        notes.get("payment_link_id"),
-    }
-    normalized = {candidate.strip() for candidate in candidates if isinstance(candidate, str) and candidate.strip()}
-    return allowed_page_id in normalized
-
-
-def _page_id_candidates(payment: dict, payment_link: dict, notes: dict) -> list[str]:
-    raw = [
-        payment.get("payment_link_id"),
-        payment_link.get("id"),
-        payment_link.get("reference_id"),
-        notes.get("payment_page_id"),
-        notes.get("payment_link_id"),
-    ]
-    return [str(x).strip() for x in raw if isinstance(x, str) and str(x).strip()]
+    if required in notes:
+        val = notes[required]
+        if val not in (None, "", False):
+            return True
+    for v in notes.values():
+        if v == required:
+            return True
+        if isinstance(v, str) and v.strip() == required:
+            return True
+    return False
 
 
 WEBHOOK_HANDLED_EVENTS = frozenset(
@@ -282,7 +272,7 @@ def _save_payment_to_google_sheet(payment: dict, payment_link: dict, notes: dict
 @require_GET
 def integration_health(request):
     sheet = (getattr(settings, "GOOGLE_SHEETS_WEBAPP_URL", "") or "").strip()
-    allowed = (getattr(settings, "ALLOWED_PAYMENT_PAGE_ID", "") or "").strip()
+    gate = (getattr(settings, "NOTES_EMAIL_GATE_VALUE", "") or "").strip()
     return JsonResponse(
         {
             "google_sheets_webapp_configured": bool(sheet),
@@ -293,13 +283,16 @@ def integration_health(request):
             "email_port": getattr(settings, "EMAIL_PORT", None),
             "email_use_tls": getattr(settings, "EMAIL_USE_TLS", None),
             "email_use_ssl": getattr(settings, "EMAIL_USE_SSL", None),
-            "allowed_payment_page_id_configured": bool(allowed),
+            "notes_email_gate_required_value": gate or None,
+            "notes_email_gate_active": bool(gate),
             "razorpay_api_configured": bool(
                 (getattr(settings, "RAZORPAY_KEY_ID", "") or "").strip()
                 and (getattr(settings, "RAZORPAY_KEY_SECRET", "") or "").strip()
             ),
             "webhook_post_path": "/api/razorpay/webhook/",
-            "note": "If smtp_configured is false on Render, set EMAIL_HOST_USER and EMAIL_HOST_PASSWORD. "
+            "note": "Sheet row + email run only when merged payment/payment_link notes include NOTES_EMAIL_GATE_VALUE "
+            "(default Testing_of_CE). Set on the Razorpay Payment Link (notes). "
+            "If smtp_configured is false on Render, set EMAIL_HOST_USER and EMAIL_HOST_PASSWORD. "
             "Apps Script web app must be deployed with access: Anyone.",
         }
     )
@@ -331,21 +324,21 @@ def razorpay_webhook(request):
     payment = _enrich_payment_from_razorpay(payment)
     notes = _combined_notes(payment, payment_link)
 
-    allowed_pid = (getattr(settings, "ALLOWED_PAYMENT_PAGE_ID", "") or "").strip()
-    if allowed_pid and not _matches_allowed_payment_page_id(payment, payment_link, notes):
-        candidates = _page_id_candidates(payment, payment_link, notes)
+    gate_value = (getattr(settings, "NOTES_EMAIL_GATE_VALUE", "") or "").strip()
+    if gate_value and not _notes_pass_send_gate(notes):
         logger.info(
-            "Webhook skipped: payment page id did not match. event=%s allowed=%s candidates=%s",
+            "Webhook skipped: notes gate not satisfied. event=%s payment_id=%s note_keys=%s",
             event,
-            allowed_pid,
-            candidates,
+            payment.get("id"),
+            list(notes.keys()),
         )
         return JsonResponse(
             {
-                "status": "Email skipped for this payment page",
-                "allowed_payment_page_id": allowed_pid,
-                "seen_payment_link_ids": candidates,
-                "fix": "Set ALLOWED_PAYMENT_PAGE_ID on Render to one of seen_payment_link_ids, or use the same Payment Link id in Razorpay.",
+                "status": "Skipped: notes do not include required value for sheet and email",
+                "required_notes_marker": gate_value,
+                "hint": "Add this value as a Razorpay Payment Link note (e.g. key purpose, value Testing_of_CE), "
+                "or a note key exactly matching the marker with a non-empty value.",
+                "seen_note_keys": list(notes.keys()),
             },
             status=200,
         )
